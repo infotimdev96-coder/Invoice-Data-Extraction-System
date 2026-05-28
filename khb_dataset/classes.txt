@@ -3,6 +3,3 @@ Invoice Date
 Dealer Code
 Sale Order
 Vender Code
-Vehicle Code
-Route
-Warehouse

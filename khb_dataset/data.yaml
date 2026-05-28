@@ -2,13 +2,10 @@ train: ./train/images
 val: ./valid/images
 test: ./test/images
 
-nc: 8
+nc: 5
 names:
   - Invoice No
   - Invoice Date
   - Dealer Code
   - Sale Order
   - Vender Code
-  - Vehicle Code
-  - Route
-  - Warehouse

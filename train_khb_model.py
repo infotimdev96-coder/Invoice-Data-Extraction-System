@@ -32,6 +32,12 @@ def parse_args():
         action="store_true",
         help="Keep existing YOLO labels.cache files. By default they are cleared.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Dataloader workers. 0 is safer on macOS/local notebooks.",
+    )
     return parser.parse_args()
 
 
@@ -61,6 +67,15 @@ def main():
         batch=args.batch,
         project=str(project_path),
         name=args.name,
+        workers=args.workers,
+        fliplr=0.0,
+        flipud=0.0,
+        mosaic=0.0,
+        degrees=3.0,
+        translate=0.05,
+        scale=0.10,
+        perspective=0.0005,
+        close_mosaic=0,
     )
 
 

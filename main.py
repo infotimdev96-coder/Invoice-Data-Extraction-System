@@ -1,41 +1,38 @@
 import argparse
+import contextlib
+import io
+import json
+import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 import cv2
 import pandas as pd
 import pytesseract
-from ultralytics import YOLO
 
 
-COLUMNS = [
+FIELDS = [
     "Invoice No",
     "Invoice Date",
     "Dealer Code",
     "Sale Order",
     "Vender Code",
-    "Vehicle Code",
-    "Route",
-    "Warehouse",
 ]
 
-CLASS_ID_TO_FIELD = {idx: field_name for idx, field_name in enumerate(COLUMNS)}
+FIELD_SET = set(FIELDS)
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
-# Normalized crop boxes for the KHB delivery-order layout:
-# (left, top, right, bottom), each value from 0.0 to 1.0.
-FIELD_REGIONS = {
-    "Invoice No": (0.675, 0.140, 0.790, 0.160),
-    "Invoice Date": (0.835, 0.138, 0.970, 0.160),
-    "Dealer Code": (0.515, 0.207, 0.630, 0.228),
-    "Sale Order": (0.515, 0.257, 0.670, 0.278),
-    "Vender Code": (0.500, 0.315, 0.630, 0.345),
-    "Vehicle Code": (0.745, 0.315, 0.850, 0.345),
-    "Route": (0.745, 0.200, 0.970, 0.240),
-    "Warehouse": (0.745, 0.250, 0.970, 0.290),
-}
 
-DEBUG_REGION = (0.485, 0.020, 0.985, 0.385)
+def load_yolo_model(model_path):
+    # Keep stdout clean because this script returns JSON for callers.
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        from ultralytics import YOLO
+
+        return YOLO(str(model_path))
 
 
 def rotate_image(image, angle):
@@ -54,15 +51,6 @@ def rotate_image(image, angle):
     )
 
 
-def crop_region(image, region):
-    height, width = image.shape[:2]
-    left, top, right, bottom = region
-    return image[
-        int(top * height) : int(bottom * height),
-        int(left * width) : int(right * width),
-    ]
-
-
 def upscale_crop(crop, scale=10):
     return cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
 
@@ -78,10 +66,10 @@ def crop_value_area(crop, field_name):
     if field_name in {"Invoice No", "Invoice Date"}:
         return crop[int(height * 0.25) : int(height * 0.85), int(width * 0.10) : int(width * 0.90)]
 
-    if field_name in {"Dealer Code", "Sale Order", "Route", "Warehouse"}:
+    if field_name in {"Dealer Code", "Sale Order"}:
         return crop[int(height * 0.52) : int(height * 0.96), int(width * 0.05) : int(width * 0.95)]
 
-    if field_name in {"Vender Code", "Vehicle Code"}:
+    if field_name == "Vender Code":
         return crop[int(height * 0.22) : int(height * 0.60), int(width * 0.05) : int(width * 0.90)]
 
     return crop
@@ -130,6 +118,10 @@ def ocr_candidates(crop, whitelist, channels=("gray",), scales=(6, 8, 10), psm_v
                     if value:
                         candidates.append(value)
     return candidates
+
+
+def candidate_profile(ocr_mode, accurate, fast):
+    return accurate if ocr_mode == "accurate" else fast
 
 
 def only_digits(value):
@@ -200,45 +192,25 @@ def clean_vender_code(value):
     return digits
 
 
-def clean_vehicle_code(value):
-    value = re.sub(r"[^A-Za-z0-9-]", "", value).upper()
-    value = value.replace("34-", "3A-")
-    value = value.replace("14-", "3G-").replace("1G-", "3G-")
-    value = value.replace("3A-8271", "3G-8271")
-    if "-" not in value and len(value) >= 6:
-        value = f"{value[:2]}-{value[2:]}"
-    return value
-
-
-def clean_single_line(value):
-    value = re.sub(r"\s+", " ", value).strip(" .|")
-    return value
-
-
-def clean_route(value):
-    value = clean_single_line(value)
-    # This scan is very blurry; Tesseract often sees the sample route as
-    # "Kim Brerece Rt Sarl". Keep this fallback isolated to obvious matches.
-    compact = re.sub(r"[^A-Za-z0-9]", "", value).lower()
-    if "brere" in compact or "brew" in compact:
-        if "r3" in compact or "sre" in compact or "ambe" in compact:
-            return "KHB-Brewery->R3-Sre Ambel"
-        if "r6" in compact or "cham" in compact:
-            return "KHB-Brewery->R6-Chamka Leu"
-        return "KHB-Brewery->R4-Bavel"
-    return value
-
-
-def extract_field(crop, field_name):
-    original_crop = crop
+def extract_field(crop, field_name, ocr_mode="fast"):
     crop = crop_value_area(crop, field_name)
 
     if field_name == "Invoice No":
-        candidates = ocr_candidates(crop, "0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12, 15), psm_values=(6, 8))
+        profile = candidate_profile(
+            ocr_mode,
+            {"channels": ("gray", "red"), "scales": (6, 8, 10, 12, 15), "psm_values": (6, 8)},
+            {"channels": ("gray",), "scales": (8, 12), "psm_values": (6,)},
+        )
+        candidates = ocr_candidates(crop, "0123456789", **profile)
         return best_digits(candidates, 8)
 
     if field_name == "Invoice Date":
-        candidates = ocr_candidates(crop, "0123456789./-", channels=("red", "gray"), scales=(6, 8, 10, 12, 15), psm_values=(6, 8))
+        profile = candidate_profile(
+            ocr_mode,
+            {"channels": ("red", "gray"), "scales": (6, 8, 10, 12, 15), "psm_values": (6, 8)},
+            {"channels": ("red", "gray"), "scales": (8, 10), "psm_values": (6,)},
+        )
+        candidates = ocr_candidates(crop, "0123456789./-", **profile)
         cleaned = [clean_invoice_date(candidate) for candidate in candidates]
         for candidate in cleaned:
             if is_valid_date(candidate):
@@ -246,7 +218,12 @@ def extract_field(crop, field_name):
         return cleaned[0] if cleaned else ""
 
     if field_name == "Dealer Code":
-        candidates = ocr_candidates(crop, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12), psm_values=(6, 7, 8))
+        profile = candidate_profile(
+            ocr_mode,
+            {"channels": ("gray", "red"), "scales": (6, 8, 10, 12), "psm_values": (6, 7, 8)},
+            {"channels": ("gray",), "scales": (8, 10), "psm_values": (7, 8)},
+        )
+        candidates = ocr_candidates(crop, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", **profile)
         for candidate in candidates:
             cleaned = clean_dealer_code(candidate)
             if re.fullmatch(r"[A-Z]{2,4}[0-9]", cleaned):
@@ -254,81 +231,36 @@ def extract_field(crop, field_name):
         return clean_dealer_code(candidates[0]) if candidates else ""
 
     if field_name == "Sale Order":
-        candidates = ocr_candidates(crop, "0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12, 15), psm_values=(6, 8))
+        profile = candidate_profile(
+            ocr_mode,
+            {"channels": ("gray", "red"), "scales": (6, 8, 10, 12, 15), "psm_values": (6, 8)},
+            {"channels": ("gray",), "scales": (8, 12), "psm_values": (6,)},
+        )
+        candidates = ocr_candidates(crop, "0123456789", **profile)
         return clean_sale_order(best_digits(candidates, 10))
 
     if field_name == "Vender Code":
-        candidates = ocr_candidates(crop, "0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12, 15), psm_values=(6, 7))
+        profile = candidate_profile(
+            ocr_mode,
+            {"channels": ("gray", "red"), "scales": (6, 8, 10, 12, 15), "psm_values": (6, 7)},
+            {"channels": ("gray", "red"), "scales": (8, 10), "psm_values": (6,)},
+        )
+        candidates = ocr_candidates(crop, "0123456789", **profile)
         for candidate in candidates:
             cleaned = clean_vender_code(candidate)
             if len(cleaned) == 6 and cleaned.startswith("100"):
                 return cleaned
         return clean_vender_code(candidates[0]) if candidates else ""
 
-    if field_name == "Vehicle Code":
-        candidates = ocr_candidates(crop, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", channels=("red", "gray"), scales=(6, 8, 10, 12, 15), psm_values=(6, 7))
-        for candidate in candidates:
-            cleaned = clean_vehicle_code(candidate)
-            if re.fullmatch(r"[0-9][A-Z]-[0-9]{4}", cleaned):
-                return cleaned
-        return clean_vehicle_code(candidates[0]) if candidates else ""
-
-    if field_name == "Route":
-        candidates = []
-        for scale in (2, 3, 4, 6, 8, 10):
-            image = upscale_crop(original_crop, scale=scale)
-            for psm in (6, 7, 13):
-                value = ocr_plain(image, psm=psm)
-                if value:
-                    candidates.append(value)
-        for candidate in candidates:
-            cleaned = clean_route(candidate)
-            if cleaned.startswith("KHB-Brewery"):
-                return cleaned
-        return clean_route(candidates[0]) if candidates else ""
-
-    if field_name == "Warehouse":
-        candidates = []
-        for scale in (4, 6, 8, 10):
-            image = upscale_crop(crop, scale=scale)
-            value = ocr_plain(image, psm=6)
-            if value:
-                candidates.append(value)
-        for candidate in candidates:
-            cleaned = clean_single_line(candidate)
-            if "WF11" in cleaned or "WFI1" in cleaned:
-                return (
-                    cleaned.replace("WFI1", "WF11")
-                    .replace("F'G", "FG")
-                    .replace("FGW", "FG W")
-                    .replace("Warchouse", "Warehouse")
-                    .replace("Warehoute", "Warehouse")
-                )
-        return clean_single_line(candidates[0]) if candidates else ""
-
     raise ValueError(f"Unsupported field: {field_name}")
 
 
-def save_crops(image, crops_dir):
-    crops_dir.mkdir(parents=True, exist_ok=True)
-    for crop_file in crops_dir.glob("*.png"):
-        crop_file.unlink()
+def save_yolo_crops(image, model, confidence, crops_dir=None):
+    if crops_dir:
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        for crop_file in crops_dir.glob("*.png"):
+            crop_file.unlink()
 
-    crops = {}
-    for field_name, region in FIELD_REGIONS.items():
-        crop = crop_region(image, region)
-        crops[field_name] = crop
-        crop_path = crops_dir / f"{field_name.replace(' ', '_')}.png"
-        cv2.imwrite(str(crop_path), crop)
-    return crops
-
-
-def save_yolo_crops(image, model_path, crops_dir, confidence):
-    crops_dir.mkdir(parents=True, exist_ok=True)
-    for crop_file in crops_dir.glob("*.png"):
-        crop_file.unlink()
-
-    model = YOLO(str(model_path))
     results = model.predict(image, conf=confidence, verbose=False)
     names = model.names
 
@@ -336,7 +268,7 @@ def save_yolo_crops(image, model_path, crops_dir, confidence):
     for box in results[0].boxes:
         class_id = int(box.cls[0])
         field_name = names[class_id]
-        if field_name not in COLUMNS:
+        if field_name not in FIELD_SET:
             continue
 
         xmin, ymin, xmax, ymax = [int(v) for v in box.xyxy[0].tolist()]
@@ -363,54 +295,15 @@ def save_yolo_crops(image, model_path, crops_dir, confidence):
     crops = {}
     for field_name, detection in best_by_field.items():
         crops[field_name] = detection["crop"]
-        crop_path = crops_dir / f"{field_name.replace(' ', '_')}.png"
-        cv2.imwrite(str(crop_path), detection["crop"])
+        if crops_dir:
+            crop_path = crops_dir / f"{field_name.replace(' ', '_')}.png"
+            cv2.imwrite(str(crop_path), detection["crop"])
 
     return crops, best_by_field
 
 
-def save_label_crops(image, label_path, crops_dir):
-    crops_dir.mkdir(parents=True, exist_ok=True)
-    for crop_file in crops_dir.glob("*.png"):
-        crop_file.unlink()
-
-    height, width = image.shape[:2]
-    crops = {}
-    detections = {}
-
-    for line in Path(label_path).read_text().splitlines():
-        if not line.strip():
-            continue
-
-        class_id_text, x_text, y_text, w_text, h_text = line.split()[:5]
-        field_name = CLASS_ID_TO_FIELD.get(int(class_id_text))
-        if not field_name:
-            continue
-
-        x_center = float(x_text) * width
-        y_center = float(y_text) * height
-        box_width = float(w_text) * width
-        box_height = float(h_text) * height
-
-        xmin = max(int(x_center - box_width / 2), 0)
-        ymin = max(int(y_center - box_height / 2), 0)
-        xmax = min(int(x_center + box_width / 2), width)
-        ymax = min(int(y_center + box_height / 2), height)
-
-        crop = image[ymin:ymax, xmin:xmax]
-        if crop.size == 0:
-            continue
-
-        crops[field_name] = crop
-        detections[field_name] = {"box": (xmin, ymin, xmax, ymax), "score": 1.0}
-        crop_path = crops_dir / f"{field_name.replace(' ', '_')}.png"
-        cv2.imwrite(str(crop_path), crop)
-
-    return crops, detections
-
-
 def write_excel(data, output_path):
-    df = pd.DataFrame([data], columns=COLUMNS)
+    df = pd.DataFrame([data], columns=FIELDS)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
         worksheet = writer.sheets["Sheet1"]
@@ -429,32 +322,6 @@ def preprocess_full_page(image):
 
 def extract_full_text(image):
     return pytesseract.image_to_string(preprocess_full_page(image), config="--oem 3 --psm 6")
-
-
-def save_debug_image(image, output_path):
-    debug_image = image.copy()
-    height, width = debug_image.shape[:2]
-
-    left, top, right, bottom = DEBUG_REGION
-    cv2.rectangle(
-        debug_image,
-        (int(left * width), int(top * height)),
-        (int(right * width), int(bottom * height)),
-        (0, 0, 0),
-        12,
-    )
-
-    for region in FIELD_REGIONS.values():
-        left, top, right, bottom = region
-        cv2.rectangle(
-            debug_image,
-            (int(left * width), int(top * height)),
-            (int(right * width), int(bottom * height)),
-            (0, 255, 0),
-            3,
-        )
-
-    cv2.imwrite(str(output_path), debug_image)
 
 
 def save_yolo_debug_image(image, detections, output_path):
@@ -478,6 +345,73 @@ def save_yolo_debug_image(image, detections, output_path):
     cv2.imwrite(str(output_path), debug_image)
 
 
+def find_image_paths(image_path):
+    path = Path(image_path)
+    if path.is_file():
+        return [path]
+
+    if path.is_dir():
+        image_paths = sorted(
+            child for child in path.iterdir()
+            if child.is_file() and child.suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if not image_paths:
+            raise FileNotFoundError(f"No supported images found in: {path}")
+        return image_paths
+
+    raise FileNotFoundError(f"Image path does not exist: {path}")
+
+
+def child_output_path(base_path, image_path, suffix):
+    if not base_path:
+        return None
+
+    base_path = Path(base_path)
+    if base_path.suffix:
+        return base_path
+    return base_path / f"{image_path.stem}{suffix}"
+
+
+def extract_image(image_path, model, args, is_batch=False):
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise FileNotFoundError(f"Could not load image: {image_path}")
+
+    image = rotate_image(image, args.rotate)
+
+    crops_dir = None
+    if args.crops_dir:
+        crops_dir = Path(args.crops_dir) / image_path.stem if is_batch else Path(args.crops_dir)
+
+    crops, detections = save_yolo_crops(image, model, args.conf, crops_dir)
+
+    debug_path = child_output_path(args.debug_image, image_path, "_debug.jpg")
+    if debug_path:
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        save_yolo_debug_image(image, detections, debug_path)
+
+    data = {
+        field_name: extract_field(crops[field_name], field_name, args.ocr_mode) if field_name in crops else ""
+        for field_name in FIELDS
+    }
+    missing_fields = [field_name for field_name in FIELDS if field_name not in crops]
+
+    return {
+        "image_path": str(image_path),
+        "model": args.model,
+        "confidence": args.conf,
+        "data": data,
+        "missing_fields": missing_fields,
+        "detections": {
+            field_name: {
+                "confidence": round(detection["score"], 4),
+                "box": list(detection["box"]),
+            }
+            for field_name, detection in detections.items()
+        },
+    }
+
+
 def parse_args():
     default_tesseract = shutil.which("tesseract")
 
@@ -485,19 +419,20 @@ def parse_args():
         description="Extract selected KHB delivery-order fields from an image."
     )
     parser.add_argument(
+        "--image_path",
         "--image",
         default="/Users/timdev/Downloads/new-inv-image.jpeg",
-        help="Path to the delivery-order image.",
+        help="Path to one delivery-order image or a folder of images.",
     )
     parser.add_argument(
         "--output",
-        default="invoice_data.xlsx",
-        help="Path to the Excel file to create.",
+        default=None,
+        help="Optional path to an Excel file to create for single-image extraction.",
     )
     parser.add_argument(
         "--crops-dir",
-        default="savedimages",
-        help="Directory where field crop images are saved.",
+        default=None,
+        help="Optional directory where field crop images are saved.",
     )
     parser.add_argument(
         "--tesseract",
@@ -512,29 +447,30 @@ def parse_args():
     )
     parser.add_argument(
         "--full-text-output",
-        default="invoice_full_text.txt",
-        help="Path to save full-page OCR text.",
+        default=None,
+        help="Optional path to save full-page OCR text. Disabled by default for speed.",
     )
     parser.add_argument(
         "--debug-image",
-        default="debug_regions.jpg",
-        help="Path to save image with black ROI and green field boxes.",
+        default=None,
+        help="Optional path or directory to save image(s) with YOLO field detection boxes.",
     )
     parser.add_argument(
         "--model",
-        default=None,
-        help="Optional trained YOLO model path, for example runs/detect/khb_field_model-7/weights/best.pt.",
-    )
-    parser.add_argument(
-        "--labels",
-        default=None,
-        help="Optional YOLO label .txt file to crop known sample fields.",
+        default="runs/detect/khb_field_model-9/weights/best.pt",
+        help="Trained YOLO model path.",
     )
     parser.add_argument(
         "--conf",
         type=float,
         default=0.25,
         help="YOLO confidence threshold when --model is used.",
+    )
+    parser.add_argument(
+        "--ocr-mode",
+        choices=("fast", "accurate"),
+        default="accurate",
+        help="OCR pass count. Use accurate for blurry scans if fast misses fields.",
     )
     return parser.parse_args()
 
@@ -545,41 +481,34 @@ def main():
     if args.tesseract:
         pytesseract.pytesseract.tesseract_cmd = args.tesseract
 
-    image_path = Path(args.image)
-    image = cv2.imread(str(image_path))
-    if image is None:
-        raise FileNotFoundError(f"Could not load image: {image_path}")
+    model_path = Path(args.model)
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Missing model: {model_path}. Train first with train_khb_model.py."
+        )
 
-    image = rotate_image(image, args.rotate)
-    if args.labels:
-        crops, detections = save_label_crops(image, Path(args.labels), Path(args.crops_dir))
-        save_yolo_debug_image(image, detections, Path(args.debug_image))
-        mode = f"YOLO label file: {args.labels}"
-    elif args.model:
-        crops, detections = save_yolo_crops(image, Path(args.model), Path(args.crops_dir), args.conf)
-        save_yolo_debug_image(image, detections, Path(args.debug_image))
-        mode = f"YOLO model: {args.model}"
-    else:
-        crops = save_crops(image, Path(args.crops_dir))
-        save_debug_image(image, Path(args.debug_image))
-        mode = "fixed field regions"
+    image_paths = find_image_paths(args.image_path)
+    model = load_yolo_model(model_path)
+    results = [
+        extract_image(image_path, model, args, is_batch=len(image_paths) > 1)
+        for image_path in image_paths
+    ]
 
-    data = {
-        field_name: extract_field(crops[field_name], field_name) if field_name in crops else ""
-        for field_name in COLUMNS
-    }
+    if args.output:
+        if len(results) > 1:
+            df = pd.DataFrame([result["data"] | {"image_path": result["image_path"]} for result in results])
+            df.to_excel(args.output, index=False)
+        else:
+            write_excel(results[0]["data"], Path(args.output))
+    if args.full_text_output:
+        if len(image_paths) > 1:
+            raise ValueError("--full-text-output is only supported for one image.")
+        image = cv2.imread(str(image_paths[0]))
+        image = rotate_image(image, args.rotate)
+        Path(args.full_text_output).write_text(extract_full_text(image), encoding="utf-8")
 
-    write_excel(data, Path(args.output))
-    Path(args.full_text_output).write_text(extract_full_text(image), encoding="utf-8")
-
-    print(f"Extraction mode: {mode}")
-    print(f"Saved crop images to: {args.crops_dir}")
-    print(f"Saved OCR result to: {args.output}")
-    print(f"Saved full-page OCR text to: {args.full_text_output}")
-    print(f"Saved debug image to: {args.debug_image}")
-    print("Extracted data:")
-    for field_name in COLUMNS:
-        print(f"- {field_name}: {data[field_name]}")
+    payload = results[0] if len(results) == 1 else {"count": len(results), "results": results}
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
