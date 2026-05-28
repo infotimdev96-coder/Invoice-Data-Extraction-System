@@ -27,7 +27,18 @@ def parse_args():
         default="runs/detect",
         help="Directory where training runs are saved.",
     )
+    parser.add_argument(
+        "--keep-cache",
+        action="store_true",
+        help="Keep existing YOLO labels.cache files. By default they are cleared.",
+    )
     return parser.parse_args()
+
+
+def clear_label_caches(dataset_dir):
+    for cache_path in dataset_dir.glob("**/labels.cache"):
+        cache_path.unlink()
+        print(f"Removed stale cache: {cache_path}")
 
 
 def main():
@@ -37,6 +48,9 @@ def main():
         raise FileNotFoundError(
             f"Missing {data_path}. Create a YOLO dataset first, then run training."
         )
+    if not args.keep_cache:
+        clear_label_caches(data_path.parent)
+
     project_path = Path(args.project).resolve()
 
     model = YOLO(args.base_model)

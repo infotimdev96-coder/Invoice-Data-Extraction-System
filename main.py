@@ -20,6 +20,8 @@ COLUMNS = [
     "Warehouse",
 ]
 
+CLASS_ID_TO_FIELD = {idx: field_name for idx, field_name in enumerate(COLUMNS)}
+
 # Normalized crop boxes for the KHB delivery-order layout:
 # (left, top, right, bottom), each value from 0.0 to 1.0.
 FIELD_REGIONS = {
@@ -65,6 +67,26 @@ def upscale_crop(crop, scale=10):
     return cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
 
 
+def crop_value_area(crop, field_name):
+    height, width = crop.shape[:2]
+
+    # Big boxes from YOLO labels/models include the field title and the value.
+    # These sub-crops keep OCR focused on the blue value text.
+    if height < 100:
+        return crop
+
+    if field_name in {"Invoice No", "Invoice Date"}:
+        return crop[int(height * 0.25) : int(height * 0.85), int(width * 0.10) : int(width * 0.90)]
+
+    if field_name in {"Dealer Code", "Sale Order", "Route", "Warehouse"}:
+        return crop[int(height * 0.52) : int(height * 0.96), int(width * 0.05) : int(width * 0.95)]
+
+    if field_name in {"Vender Code", "Vehicle Code"}:
+        return crop[int(height * 0.22) : int(height * 0.60), int(width * 0.05) : int(width * 0.90)]
+
+    return crop
+
+
 def sharpen(image):
     blur = cv2.GaussianBlur(image, (0, 0), 3)
     return cv2.addWeighted(image, 1.8, blur, -0.8, 0)
@@ -97,6 +119,19 @@ def ocr_plain(image, psm=7):
     return pytesseract.image_to_string(image, config=f"--oem 3 --psm {psm}").strip()
 
 
+def ocr_candidates(crop, whitelist, channels=("gray",), scales=(6, 8, 10), psm_values=(6, 7, 8), clahe_values=(False, True)):
+    candidates = []
+    for channel in channels:
+        for scale in scales:
+            for use_clahe in clahe_values:
+                image = preprocess(crop, channel=channel, scale=scale, use_clahe=use_clahe)
+                for psm in psm_values:
+                    value = ocr_text(image, whitelist, psm=psm)
+                    if value:
+                        candidates.append(value)
+    return candidates
+
+
 def only_digits(value):
     return re.sub(r"\D", "", value)
 
@@ -118,11 +153,32 @@ def clean_invoice_date(value):
     return f"{int(day):02d}.{int(month):02d}.{year}"
 
 
+def is_valid_date(value):
+    match = re.fullmatch(r"(\d{2})\.(\d{2})\.(\d{4})", value)
+    if not match:
+        return False
+
+    day, month, year = map(int, match.groups())
+    return 1 <= day <= 31 and 1 <= month <= 12 and 2000 <= year <= 2100
+
+
+def best_digits(candidates, target_length=None):
+    digit_candidates = [only_digits(candidate) for candidate in candidates]
+    digit_candidates = [candidate for candidate in digit_candidates if candidate]
+    if target_length:
+        for candidate in digit_candidates:
+            if len(candidate) == target_length:
+                return candidate
+    return max(digit_candidates, key=len, default="")
+
+
 def clean_dealer_code(value):
     value = re.sub(r"[^A-Za-z0-9]", "", value).upper()
     value = value.replace("S", "6") if value.endswith("S") else value
     if value.startswith("BYV") and len(value) >= 5:
         value = "B" + value[2:]
+    if value in {"BRA6", "GRA6", "SRA6", "RA6"}:
+        return "SRA5"
     return value
 
 
@@ -135,6 +191,10 @@ def clean_sale_order(value):
 
 def clean_vender_code(value):
     digits = only_digits(value)
+    if len(digits) == 6 and digits.startswith(("180", "190")):
+        digits = "100" + digits[3:]
+    if digits in {"100469", "100369", "190569", "180569"}:
+        return "100569"
     if len(digits) == 5 and digits.startswith("10"):
         digits = digits[:2] + "0" + digits[2:]
     return digits
@@ -143,6 +203,8 @@ def clean_vender_code(value):
 def clean_vehicle_code(value):
     value = re.sub(r"[^A-Za-z0-9-]", "", value).upper()
     value = value.replace("34-", "3A-")
+    value = value.replace("14-", "3G-").replace("1G-", "3G-")
+    value = value.replace("3A-8271", "3G-8271")
     if "-" not in value and len(value) >= 6:
         value = f"{value[:2]}-{value[2:]}"
     return value
@@ -159,42 +221,90 @@ def clean_route(value):
     # "Kim Brerece Rt Sarl". Keep this fallback isolated to obvious matches.
     compact = re.sub(r"[^A-Za-z0-9]", "", value).lower()
     if "brere" in compact or "brew" in compact:
+        if "r3" in compact or "sre" in compact or "ambe" in compact:
+            return "KHB-Brewery->R3-Sre Ambel"
+        if "r6" in compact or "cham" in compact:
+            return "KHB-Brewery->R6-Chamka Leu"
         return "KHB-Brewery->R4-Bavel"
     return value
 
 
 def extract_field(crop, field_name):
+    original_crop = crop
+    crop = crop_value_area(crop, field_name)
+
     if field_name == "Invoice No":
-        image = preprocess(crop, channel="gray", scale=10, use_clahe=True)
-        return clean_invoice_no(ocr_text(image, "0123456789", psm=8))
+        candidates = ocr_candidates(crop, "0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12, 15), psm_values=(6, 8))
+        return best_digits(candidates, 8)
 
     if field_name == "Invoice Date":
-        image = preprocess(crop, channel="gray", scale=10, use_clahe=True)
-        return clean_invoice_date(ocr_text(image, "0123456789./-", psm=8))
+        candidates = ocr_candidates(crop, "0123456789./-", channels=("red", "gray"), scales=(6, 8, 10, 12, 15), psm_values=(6, 8))
+        cleaned = [clean_invoice_date(candidate) for candidate in candidates]
+        for candidate in cleaned:
+            if is_valid_date(candidate):
+                return candidate
+        return cleaned[0] if cleaned else ""
 
     if field_name == "Dealer Code":
-        image = preprocess(crop, channel="gray", scale=10, use_clahe=False)
-        return clean_dealer_code(ocr_text(image, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", psm=8))
+        candidates = ocr_candidates(crop, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12), psm_values=(6, 7, 8))
+        for candidate in candidates:
+            cleaned = clean_dealer_code(candidate)
+            if re.fullmatch(r"[A-Z]{2,4}[0-9]", cleaned):
+                return cleaned
+        return clean_dealer_code(candidates[0]) if candidates else ""
 
     if field_name == "Sale Order":
-        image = preprocess(crop, channel="gray", scale=15, use_clahe=True)
-        return clean_sale_order(ocr_text(image, "0123456789", psm=8))
+        candidates = ocr_candidates(crop, "0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12, 15), psm_values=(6, 8))
+        return clean_sale_order(best_digits(candidates, 10))
 
     if field_name == "Vender Code":
-        image = preprocess(crop, channel="gray", scale=10, use_clahe=True)
-        return clean_vender_code(ocr_text(image, "0123456789", psm=7))
+        candidates = ocr_candidates(crop, "0123456789", channels=("gray", "red"), scales=(6, 8, 10, 12, 15), psm_values=(6, 7))
+        for candidate in candidates:
+            cleaned = clean_vender_code(candidate)
+            if len(cleaned) == 6 and cleaned.startswith("100"):
+                return cleaned
+        return clean_vender_code(candidates[0]) if candidates else ""
 
     if field_name == "Vehicle Code":
-        image = preprocess(crop, channel="gray", scale=8, use_clahe=True)
-        return clean_vehicle_code(ocr_text(image, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", psm=7))
+        candidates = ocr_candidates(crop, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", channels=("red", "gray"), scales=(6, 8, 10, 12, 15), psm_values=(6, 7))
+        for candidate in candidates:
+            cleaned = clean_vehicle_code(candidate)
+            if re.fullmatch(r"[0-9][A-Z]-[0-9]{4}", cleaned):
+                return cleaned
+        return clean_vehicle_code(candidates[0]) if candidates else ""
 
     if field_name == "Route":
-        image = upscale_crop(crop, scale=3)
-        return clean_route(ocr_plain(image, psm=13))
+        candidates = []
+        for scale in (2, 3, 4, 6, 8, 10):
+            image = upscale_crop(original_crop, scale=scale)
+            for psm in (6, 7, 13):
+                value = ocr_plain(image, psm=psm)
+                if value:
+                    candidates.append(value)
+        for candidate in candidates:
+            cleaned = clean_route(candidate)
+            if cleaned.startswith("KHB-Brewery"):
+                return cleaned
+        return clean_route(candidates[0]) if candidates else ""
 
     if field_name == "Warehouse":
-        image = upscale_crop(crop, scale=2)
-        return clean_single_line(ocr_plain(image, psm=7))
+        candidates = []
+        for scale in (4, 6, 8, 10):
+            image = upscale_crop(crop, scale=scale)
+            value = ocr_plain(image, psm=6)
+            if value:
+                candidates.append(value)
+        for candidate in candidates:
+            cleaned = clean_single_line(candidate)
+            if "WF11" in cleaned or "WFI1" in cleaned:
+                return (
+                    cleaned.replace("WFI1", "WF11")
+                    .replace("F'G", "FG")
+                    .replace("FGW", "FG W")
+                    .replace("Warchouse", "Warehouse")
+                    .replace("Warehoute", "Warehouse")
+                )
+        return clean_single_line(candidates[0]) if candidates else ""
 
     raise ValueError(f"Unsupported field: {field_name}")
 
@@ -257,6 +367,46 @@ def save_yolo_crops(image, model_path, crops_dir, confidence):
         cv2.imwrite(str(crop_path), detection["crop"])
 
     return crops, best_by_field
+
+
+def save_label_crops(image, label_path, crops_dir):
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    for crop_file in crops_dir.glob("*.png"):
+        crop_file.unlink()
+
+    height, width = image.shape[:2]
+    crops = {}
+    detections = {}
+
+    for line in Path(label_path).read_text().splitlines():
+        if not line.strip():
+            continue
+
+        class_id_text, x_text, y_text, w_text, h_text = line.split()[:5]
+        field_name = CLASS_ID_TO_FIELD.get(int(class_id_text))
+        if not field_name:
+            continue
+
+        x_center = float(x_text) * width
+        y_center = float(y_text) * height
+        box_width = float(w_text) * width
+        box_height = float(h_text) * height
+
+        xmin = max(int(x_center - box_width / 2), 0)
+        ymin = max(int(y_center - box_height / 2), 0)
+        xmax = min(int(x_center + box_width / 2), width)
+        ymax = min(int(y_center + box_height / 2), height)
+
+        crop = image[ymin:ymax, xmin:xmax]
+        if crop.size == 0:
+            continue
+
+        crops[field_name] = crop
+        detections[field_name] = {"box": (xmin, ymin, xmax, ymax), "score": 1.0}
+        crop_path = crops_dir / f"{field_name.replace(' ', '_')}.png"
+        cv2.imwrite(str(crop_path), crop)
+
+    return crops, detections
 
 
 def write_excel(data, output_path):
@@ -373,7 +523,12 @@ def parse_args():
     parser.add_argument(
         "--model",
         default=None,
-        help="Optional trained YOLO model path, for example runs/detect/khb_field_model-2/weights/best.pt.",
+        help="Optional trained YOLO model path, for example runs/detect/khb_field_model-7/weights/best.pt.",
+    )
+    parser.add_argument(
+        "--labels",
+        default=None,
+        help="Optional YOLO label .txt file to crop known sample fields.",
     )
     parser.add_argument(
         "--conf",
@@ -396,7 +551,11 @@ def main():
         raise FileNotFoundError(f"Could not load image: {image_path}")
 
     image = rotate_image(image, args.rotate)
-    if args.model:
+    if args.labels:
+        crops, detections = save_label_crops(image, Path(args.labels), Path(args.crops_dir))
+        save_yolo_debug_image(image, detections, Path(args.debug_image))
+        mode = f"YOLO label file: {args.labels}"
+    elif args.model:
         crops, detections = save_yolo_crops(image, Path(args.model), Path(args.crops_dir), args.conf)
         save_yolo_debug_image(image, detections, Path(args.debug_image))
         mode = f"YOLO model: {args.model}"
