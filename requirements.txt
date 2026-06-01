@@ -4,3 +4,7 @@ pandas
 openpyxl
 numpy
 ultralytics
+fastapi
+uvicorn
+python-multipart
+pillow

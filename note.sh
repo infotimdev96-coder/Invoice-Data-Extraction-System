@@ -29,6 +29,7 @@ source venv/bin/activate
 # 2 Dealer Code
 # 3 Sale Order
 # 4 Vender Code
+# 5 Vehicle Code
 #
 # Best practice for this project:
 # Draw one box around the whole field cell, like your black boxes.
@@ -47,17 +48,26 @@ python train_khb_model.py \
   --epochs 100 \
   --imgsz 960 \
   --batch 1 \
-  --name khb_field_model
+  --name khb_field_model_6fields
 
 
 # 5) Use trained model to get data from a new invoice image
 # No label file is used here.
 python main.py \
-  --image_path "/Users/timdev/Downloads/new-inv-image.jpeg" \
+  --image_path images \
   --conf 0.25
 
 
 # 6) If the model misses fields, try lower confidence
 python main.py \
-  --image_path "/Users/timdev/Downloads/new-inv-image.jpeg" \
+  --image_path images \
   --conf 0.10
+
+
+python main.py \
+  --image_path images \
+  --conf 0.10 \
+  --crops-dir crops
+
+
+  python mainv2.py --image images --tesseract --conf 0.10 --crops-dir crops 
