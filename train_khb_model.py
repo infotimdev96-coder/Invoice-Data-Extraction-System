@@ -1,8 +1,6 @@
 import argparse
 import os
 import shutil
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -24,7 +22,7 @@ DEFAULT_FIELDS = [
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train the v2 KHB invoice extractor: YOLO field boxes plus optional Tesseract OCR model."
+        description="Train the KHB invoice YOLO field detector."
     )
     parser.add_argument(
         "--data",
@@ -33,8 +31,8 @@ def parse_args():
     )
     parser.add_argument(
         "--base-model",
-        default="yolov8n.pt",
-        help="Base YOLOv8 model to fine-tune.",
+        default="yolov11n.pt",
+        help="Base YOLOv11 model to fine-tune.",
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--imgsz", type=int, default=960)
@@ -64,44 +62,13 @@ def parse_args():
     parser.add_argument(
         "--skip-yolo",
         action="store_true",
-        help="Skip YOLO training and only run validation/Tesseract steps.",
+        help="Skip YOLO training after validating the dataset.",
     )
     parser.add_argument(
         "--validate-only",
         action="store_true",
         help="Validate the dataset and exit without training.",
     )
-    parser.add_argument(
-        "--train-tesseract",
-        action="store_true",
-        help="Also fine-tune Tesseract from labeled field/value crops.",
-    )
-    parser.add_argument(
-        "--tesseract-ground-truth-dir",
-        default="tesseract_training/value_ground_truth",
-        help="Folder containing Tesseract crop images and matching .gt.txt labels.",
-    )
-    parser.add_argument(
-        "--tesseract-lang-name",
-        default="khb_invoice_values",
-        help="Name for the exported Tesseract .traineddata file.",
-    )
-    parser.add_argument(
-        "--tesseract-base-lang",
-        default="eng",
-        help="Base Tesseract language to fine-tune from.",
-    )
-    parser.add_argument(
-        "--tessdata-dir",
-        default="tesseract_training/tessdata_best",
-        help="Folder containing the base .traineddata file.",
-    )
-    parser.add_argument(
-        "--tesseract-output-dir",
-        default="tesseract_training/output",
-        help="Folder where Tesseract checkpoints and final .traineddata are written.",
-    )
-    parser.add_argument("--tesseract-max-iterations", type=int, default=1000)
     return parser.parse_args()
 
 
@@ -205,32 +172,6 @@ def copy_best_checkpoint(project_path, run_name, export_model):
     print(f"Copied YOLO v2 checkpoint to: {export_path}")
 
 
-def train_tesseract(args):
-    script_path = Path("tesseract_training/train_tesseract_invoice.py")
-    if not script_path.exists():
-        raise FileNotFoundError(f"Missing Tesseract trainer: {script_path}")
-
-    command = [
-        sys.executable,
-        str(script_path),
-        "--ground-truth-dir",
-        args.tesseract_ground_truth_dir,
-        "--lang-name",
-        args.tesseract_lang_name,
-        "--base-lang",
-        args.tesseract_base_lang,
-        "--tessdata-dir",
-        args.tessdata_dir,
-        "--output-dir",
-        args.tesseract_output_dir,
-        "--max-iterations",
-        str(args.tesseract_max_iterations),
-    ]
-    print("Training Tesseract OCR model:")
-    print(" ".join(command))
-    subprocess.run(command, check=True)
-
-
 def main():
     args = parse_args()
     data_path = Path(args.data)
@@ -268,10 +209,6 @@ def main():
             close_mosaic=0,
         )
         copy_best_checkpoint(project_path, args.name, args.export_model)
-
-    if args.train_tesseract:
-        train_tesseract(args)
-
 
 if __name__ == "__main__":
     main()

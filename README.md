@@ -1,68 +1,107 @@
-# Invoice Data Extraction System
+# Invoice Field Detection System
 
-This project aims to automate the extraction of data from invoice images using a combination of YOLOv8 for object detection and Optical Character Recognition (OCR) for text extraction. The system can identify specific fields such as invoice ID, total amount, address, etc., and convert the extracted information into an Excel sheet with appropriate headings.
-
-## Table of Contents
-- [Features](#features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Model Training](#model-training)
-- [OCR Integration](#ocr-integration)
-- [Output](#output)
-- [Screenshots](#screenshots)
-- [Contributing](#contributing)
-- [License](#license)
+This project uses a custom YOLO model to detect invoice fields and save each
+detected field as a cropped image. It does not perform text recognition.
 
 ## Features
+
 - Train YOLOv8 on annotated invoice images.
-- Detect specific fields on new invoice images.
-- Extract text from detected fields using OCR.
-- Export extracted data to an Excel sheet.
+- Detect six invoice fields:
+  - Invoice No
+  - Invoice Date
+  - Dealer Code
+  - Sale Order
+  - Vender Code
+  - Vehicle Code
+- Save detected field crops for later use.
+- Print detection confidence scores, bounding boxes, and missing fields as JSON.
 
 ## Installation
-1. Clone the repository:
-    ```bash
-    git clone https://github.com/jawadshahid07/Invoice-Data-Extraction-System.git
-    cd invoice-data-extraction
-    ```
-2. Set up a Python virtual environment:
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-    ```
-3. Install required packages:
-    ```bash
-    pip install -r requirements.txt
-    ```
-4. Download, install, and setup Tesseract OCR. Here is the documentation: https://tesseract-ocr.github.io/
 
-## Usage
-1. (OPTIONAL) There is already a trained model present with the file name "yolov8n.pt". You may train your own model, with your own code or by modifying the code. The code for training the model is in the file "yolov8_model_training_for_invoices.ipynb".
-2. (OPTIONAL) To visualize how the model works on invoice images, you may use the code in the file "yolov8 predict.ipynb", which outputs in an image with annotated results. 
-3. To use the project, we first run the code in "yolov8 extraction.ipynb", which takes an image, identifies labels on it, and extracts each label as it's own image file. The name of the image indicates the label. The extracted data in form of images is saved in "savedimages" directory.
-4. We then run the "ocr to excel.ipynb". This code uses Tesseract OCR to convert each of the images, which contain one label, to text and stores it in an excel sheet under the correct heading. The output is your excel sheet.
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-## Model Training
-1. Annotate your invoice images with fields such as invoice ID, total amount, address, etc.
-2. Use the YOLOv8 framework to train the model with these annotated images.
-3. Save the trained model weights.
+## Detect Fields
 
-## OCR Integration
-1. Use Tesseract OCR library to extract text from the detected fields.
-2. Map the detected fields to the corresponding text extracted by the OCR.
+```bash
+python main.py \
+  --image_path images \
+  --model runs/detect/khb_field_model_6fields/weights/best.pt \
+  --conf 0.25 \
+  --crop-dir crops
+```
 
-## Output
-The final output will be an Excel sheet with the extracted data, organized with appropriate headings.
+Use `--crop-dir ""` to print detections without saving crop images.
 
-## Screenshots
-![YOLOv8 Detection](screenshots/prediction.jpg)  
-*Caption: YOLOv8 detecting fields on an invoice.*
+## Train Tesseract OCR For Field Text
 
-![Label 1](savedimages/TOTAL_ID_3.png) ![Label 2](savedimages/TOTAL_2.png) ![Label 3](savedimages/INV_DATE_ID_1.png) ![Label 4](savedimages/INV_DATE_7.png)  
-*Caption: Results of the prediction code, separating each label into it's own image*
+YOLO training detects the invoice fields. Tesseract training needs separate
+ground truth: each saved field crop must have the exact text value from that
+crop.
 
-![Excel Output](screenshots/exceldata.png)  
-*Caption: Extracted data saved in an Excel sheet.*
+This project now uses the official Tesseract 5 `tesstrain` workflow:
 
-## Contributing
-Contributions are welcome! Please open an issue or submit a pull request for any changes.
+```bash
+brew install make wget
+git clone https://github.com/tesseract-ocr/tesstrain.git tools/tesstrain
+mkdir -p training/tessdata_best
+wget -O training/tessdata_best/eng.traineddata \
+  https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata
+```
+
+Create Tesseract ground-truth pairs from the existing YOLO crops and Excel truth
+file:
+
+```bash
+source venv/bin/activate
+python scripts/prepare_tesseract_gt.py \
+  --crops-dir crops_v2 \
+  --truth-xlsx invoice_data_v2.xlsx \
+  --output-dir training/tesseract/khb_invoice-ground-truth
+```
+
+Start fine-tuning from the trainable English `tessdata_best` model:
+
+```bash
+MODEL_NAME=khb_invoice_best \
+GROUND_TRUTH_DIR=training/tesseract/khb_invoice-ground-truth \
+TESSDATA=training/tessdata_best \
+MAX_ITERATIONS=300 \
+scripts/train_tesseract_khb.sh
+```
+
+The main trained model is written to:
+
+```text
+tools/tesstrain/data/khb_invoice_best.traineddata
+```
+
+Smoke-test the trained model on one prepared crop:
+
+```bash
+tesseract training/tesseract/khb_invoice-ground-truth/05_Invoice_Date.png stdout \
+  --tessdata-dir tools/tesstrain/data \
+  -l khb_invoice_best \
+  --psm 7
+```
+
+The current starter dataset has only a small number of non-empty text labels.
+Use it to verify the pipeline, then add many more corrected crop/text pairs
+before relying on OCR accuracy.
+
+## Train The YOLO Model
+
+```bash
+python train_khb_model.py \
+  --data khb_dataset/data.yaml \
+  --epochs 100 \
+  --imgsz 960 \
+  --batch 1 \
+  --name khb_field_model_6fields
+```
+
+The dataset labels are used only during training. Production field detection
+uses the trained YOLO checkpoint and invoice images.

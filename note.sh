@@ -33,7 +33,7 @@ source venv/bin/activate
 #
 # Best practice for this project:
 # Draw one box around the whole field cell, like your black boxes.
-# The OCR code will crop inside the detected cell to read only the blue value.
+# Each detected field cell is saved as a YOLO crop.
 
 
 # 3) Check dataset quickly
@@ -67,7 +67,7 @@ python main.py \
 python main.py \
   --image_path images \
   --conf 0.10 \
-  --crops-dir crops
+  --crop-dir crops
 
 
-  python mainv2.py --image images --tesseract --conf 0.10 --crops-dir crops 
+uvicorn app:app --host 192.168.0.44 --port 8000 --reload
